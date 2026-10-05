@@ -1,0 +1,7 @@
+.dockerignore
+Dockerfile
+target
+examples
+.git/
+scripts/
+client/

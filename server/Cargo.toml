@@ -1,0 +1,25 @@
+[package]
+name = "asr-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+asr = { path = "..", features = ["multitalker"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.20"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["stream", "rustls-tls"], default-features = false }
+dirs = "5.0"
+
+[features]
+# Retained for compatibility with existing scripts, but NOT safe to enable
+# unless a matching system `libonnxruntime.so` is installed. Without one, `ort`
+# calls `dlopen` at runtime, that fails, and the error-reporting path re-enters
+# `ort::api()` while its `OnceLock` is still initializing -- a self-deadlock on
+# a `std::sync::Once` futex that hangs the server forever with no output. The
+# build still succeeds, so it looks like a slow model load. `src/glibc_compat.rs`
+# already handles the prebuilt-binary glibc mismatch, so a plain `cargo build`
+# works on glibc < 2.38 and this feature is never needed.
+load-dynamic = ["asr/load-dynamic"]

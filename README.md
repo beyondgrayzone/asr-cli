@@ -1,223 +1,247 @@
-# parakeet-rs
-[![Rust](https://github.com/altunenes/parakeet-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/altunenes/parakeet-rs/actions/workflows/rust.yml)
-[![crates.io](https://img.shields.io/crates/v/parakeet-rs.svg)](https://crates.io/crates/parakeet-rs)
+# asr-server
 
-Fast speech recognition with NVIDIA's Parakeet models via ONNX Runtime.
+Real-time speech recognition server: NVIDIA **Parakeet / Nemotron** models via ONNX Runtime, exposed over a
+WebSocket API.
 
-Note: CoreML is unstable with this model. For Apple, use WebGPU EP (uses metal under the hood,dont confuse by its name :-). it's a native GPU standard, not only web) or CPU. But even CPU alone is significantly faster on my Mac M3 16GB compared to Whisper metal! :-)
+- `src/`  the `asr` Rust library (ONNX wrappers, mel front-end, RNNT decoding, diarisation)
+- `server/`  the `asr-server` binary: model download + WebSocket server
+- `client/`  Go microphone client that streams to the server
+
+## Docker (recommended)
+
+### Create a volume to store models
+
+```
+docker volume create asr_data
+```
+
+### Build
+
+```
+BUILDKIT_PROGRESS=plain docker build -f Dockerfile -t asr_server:0.0.1 .
+```
+
+### Run
+
+```
+docker run --name asr_server -it -p 9393:9393 -v asr_data:/home/ubuntu/.asr asr_server:0.0.1
+```
+
+`asr_data` is mounted at `/home/ubuntu/.asr`, so downloaded models survive container restarts and rebuilds.
+The image is CPU-only; it ships `libgomp1` and `libssl3` for ONNX Runtime.
+
+## Build from source
+
+```
+cd server
+cargo build --release
+./target/release/asr-server
+```
+
+### If linking fails with `undefined symbol: __isoc23_strtol`
+
+`ort-sys` downloads a prebuilt `libonnxruntime` that requires **glibc ≥ 2.38** (Ubuntu 24.04+). On older
+systems (Ubuntu 22.04 ships glibc 2.35) the link step reports three missing symbols:
+
+```
+rust-lld: error: undefined symbol: __isoc23_strtol
+rust-lld: error: undefined symbol: __isoc23_strtoll
+rust-lld: error: undefined symbol: __isoc23_strtoull
+```
+
+glibc 2.38 renamed the `strtol` family to the C23 `__isoc23_*` variants, and the prebuilt binary
+references the new names. This is already handled for you: `src/glibc_compat.rs` defines the three
+symbols and forwards them to the host glibc's `strtol`/`strtoll`/`strtoull`. The `long` and `long long`
+return values are ABI-identical on x86_64, and the only behavioural difference (C23 locale
+digit-grouping) is not used by ONNX Runtime. A plain `cargo build` works on both old and new glibc, and
+the module is a no-op on non-`linux-gnu` targets.
+
+> **Do not use `--features load-dynamic` to work around this.** It only helps if a matching
+> `libonnxruntime.so` is already installed system-wide. When none is, `ort` falls back to `dlopen` at
+> runtime, that call fails, and the error-reporting path re-enters `ort::api()` while its `OnceLock` is
+> still initializing  a self-deadlock on a `std::sync::Once` futex. The process hangs forever with no
+> error output and the loader thread sits at 0% CPU in `futex_wait`. The build appears to succeed, so
+> this is easy to mistake for a slow model load.
+>
+> A plain `cargo run --release` is the correct command. If you have a script or alias that passes
+> `--features load-dynamic`, drop the flag: `cargo run --release` works on both old and new glibc.
+
+### If you really need `load-dynamic`
+
+The feature is gated at compile time so the silent hang above cannot happen by accident. Setting
+`load-dynamic` without opting in is a build error:
+
+```
+error: asr: `load-dynamic` needs ASR_ALLOW_LOAD_DYNAMIC=1; see Cargo.toml. Otherwise build plain.
+```
+
+To override, set `ASR_ALLOW_LOAD_DYNAMIC=1` in the same command  but only do that if you have
+confirmed a matching `libonnxruntime.so` is actually installed system-wide:
+
+```
+ASR_ALLOW_LOAD_DYNAMIC=1 ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so cargo run --release --features load-dynamic
+```
+
+Note that `ASR_ALLOW_LOAD_DYNAMIC` is checked at *build* time, so changing it later has no effect on
+an already-built binary. If the server hangs, check how the current binary was built:
+
+```
+nm target/debug/asr-server | grep -c isoc23   # 3 = good, 0 = built with load-dynamic
+```
+
+## Run
+
+```
+asr-server [--port <port>]
+```
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--port` / `-p` | `9393` | TCP port to bind on `0.0.0.0` |
+| `ASR_PORT` (env) | `9393` | Used when `--port` is not given |
+
+```
+./asr-server --port 9393
+ASR_PORT=8080 ./asr-server
+```
+
+The server tunes ONNX Runtime for low-latency single-threaded streaming (`ORT_INTRA_OP_NUM_THREADS=1`,
+`ORT_INTER_OP_NUM_THREADS=1`, `ORT_ARENA_CFG=cpu:0`, `OMP_WAIT_POLICY=PASSIVE`).
 
 ## Models
 
-**CTC (English-only)**:
+Models are downloaded **on first connection**, not at startup. They are cached in `~/.asr/` and reused
+afterwards (a file is skipped if it already exists and is non-empty).
+
+| Mode / language | Directory | Files |
+| --- | --- | --- |
+| `multitalker` | `~/.asr/multitalker` | `encoder.int8.onnx`, `decoder_joint.int8.onnx`, `tokenizer.model` |
+| `multitalker` | `~/.asr/` | `diar_streaming_sortformer_4spk-v2.1.onnx` |
+| `asr` + `language: "en"` | `~/.asr/nemotron_en` | `encoder.onnx` + `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` |
+| `asr` + `language: "all"` | `~/.asr/nemotron_multi` | `encoder.onnx` + `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` |
+
+Sources:
+
+- `multitalker` → [`smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8`](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8)
+- Sortformer + Nemotron → [`altunenes/parakeet-rs`](https://huggingface.co/altunenes/parakeet-rs)
+
+Downloading several GB can take a while. The client prints a status line while this is in progress  let it
+finish before assuming the connection failed.
+
+### Which model gets picked
+
+`language` selects the **weights**, `target_lang` selects the **prompt index** inside the multilingual model:
+
+- `language: "en"`  English-specialist Nemotron 0.6B (vocab 1024, no language conditioning).
+  `target_lang` is ignored.
+- `language: "all"`  multilingual Nemotron 3.5 0.6B (vocab ~13k, has a `prompt_index` input).
+  `target_lang` accepts any key from the prompt dictionary, or `auto` (the default) to let the model
+  detect the language itself.
+
+## WebSocket protocol
+
+Connect to `ws://<host>:9393`. Audio must be **16 kHz, mono, `f32` little-endian, raw** (no WAV header).
+
+### 1. Client → server: configuration (text frame, first message)
+
+```json
+{ "mode": "asr", "language": "en", "target_lang": "tr-TR" }
+```
+
+| Field | Required | Values |
+| --- | --- | --- |
+| `mode` | yes | `asr` or `multitalker` |
+| `language` | no | `en` (default) or `all` |
+| `target_lang` | no | e.g. `tr-TR`, `ja-JP`, `auto`. Only used with `language: "all"` |
+
+`mode` is matched literally  anything other than `multitalker` falls through to the Nemotron/`asr` path.
+
+### 2. Server → client: status
+
+| Message | Meaning |
+| --- | --- |
+| `loading` | Download/load in progress. Send nothing yet; binary frames sent now may be dropped while the model loads. |
+| `ready` | Model loaded. Start streaming audio. |
+| `error: <message>` | Download or load failed. The server then closes the connection. |
+
+### 3. Client → server: audio (binary frames)
+
+Each binary frame is a packed array of `f32` LE samples. Chunk size is up to you  the model buffers
+internally and only emits text once it has a full encoder chunk (~560 ms for `asr`, ~1.12 s for
+`multitalker`).
+
+### 4. Server → client: transcripts (text frames, JSON)
+
+```json
+{ "text": "hello world", "speaker_id": 0, "words": [ { "word": "hello", "start_secs": 0.08, "end_secs": 0.24 } ] }
+```
+
+| Field | `asr` mode | `multitalker` mode |
+| --- | --- | --- |
+| `text` | emitted text delta for this chunk | emitted text delta for this speaker |
+| `speaker_id` | `null` | speaker index (0–3) |
+| `words` | `null` | word-level timestamps for this delta |
+
+In `asr` mode empty deltas are suppressed. In `multitalker` mode you get one message per active speaker
+per chunk, and `speaker_id` marks who is talking.
+
+### Protocol notes
+
+- One model instance is created **per connection**, so each connection pays full model load cost and its own
+  memory. Reuse a single connection for a session.
+- There is no explicit end-of-stream message; closing the socket ends the session.
+- The server does not reset decoder state between chunks on its own  treat a new `ConfigMsg`/connection as a
+  fresh stream.
+
+## Feature flags
+
+Default build is CPU-only with ONNX Runtime's default providers. Accelerator backends are compiled in only
+when their `asr` feature is enabled:
+
+```
+cargo build --release --features cuda       # NVIDIA CUDA (falls back to CPU)
+cargo build --release --features tensorrt   # NVIDIA TensorRT
+cargo build --release --features coreml     # Apple CoreML / ANE
+cargo build --release --features directml   # Windows DirectML
+cargo build --release --features migraphx
+cargo build --release --features openvino
+cargo build --release --features webgpu     # experimental
+cargo build --release --features nnapi      # Android
+```
+
+The `server` binary always uses `ExecutionProvider::Cpu` with 1 intra / 1 inter thread. To pick a
+different provider you construct your own `ExecutionConfig` when using the `asr` library directly.
+
+Optional model features in the library: `multitalker` (Sortformer + speaker kernels, enabled by default in
+`server/`), `sortformer`, `cohere`.
+
+## Tests
+
+```
+cargo test --lib          # unit tests, no model files required
+```
+
+## Library usage
+
 ```rust
-use parakeet_rs::{Parakeet, Transcriber, TimestampMode};
+use asr::{ExecutionConfig, Nemotron, NemotronMode};
 
-let mut parakeet = Parakeet::from_pretrained(".", None)?;
-
-// Load and transcribe audio (see examples/raw.rs for full example)
-let result = parakeet.transcribe_samples(audio, 1600, 1, Some(TimestampMode::Words))?;
-println!("{}", result.text);
-
-// Token-level timestamps
-for token in result.tokens {
-    println!("[{:.3}s - {:.3}s] {}", token.start, token.end, token.text);
-}
-```
-
-**TDT (Multilingual)**: 25 languages with auto-detection
-```rust
-use parakeet_rs::{ParakeetTDT, Transcriber, TimestampMode};
-
-let mut parakeet = ParakeetTDT::from_pretrained("./tdt", None)?;
-let result = parakeet.transcribe_samples(audio, 16000, 1, Some(TimestampMode::Sentences))?;
-println!("{}", result.text);
-
-// Token-level timestamps
-for token in result.tokens {
-    println!("[{:.3}s - {:.3}s] {}", token.start, token.end, token.text);
-}
-```
-
-**EOU (Streaming)**: Real-time ASR with end-of-utterance detection
-```rust
-use parakeet_rs::ParakeetEOU;
-
-let mut parakeet = ParakeetEOU::from_pretrained("./eou", None)?;
-
-// Prepare your audio (Vec<f32>, 16kHz mono, normalized)
-let audio: Vec<f32> = /* your audio samples */;
-
-// Process in 160ms chunks for streaming
-const CHUNK_SIZE: usize = 2560; // 160ms at 16kHz
-for chunk in audio.chunks(CHUNK_SIZE) {
-    let text = parakeet.transcribe(chunk, false)?;
-    print!("{}", text);
-}
-```
-
-**Nemotron (Streaming)**: Cache-aware streaming ASR with punctuation. Two variants share the same API — point `from_pretrained` at whatever directory holds the ONNX files and the loader auto-detects which variant it is:
-
-- **English-only 0.6B** — verbatim English, preserves disfluencies (`um`, `uh`). Best for transcription where every spoken word matters.
-- **Multilingual 3.5 0.6B** — [40 language-locales](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) across 3 tiers (19 transcription-ready, 13 broad-coverage, 8 that need fine-tuning to reach production quality based on the NVIDIA). Polished output (proper casing/punctuation, drops disfluencies). Same speed and size as the English-only model.
-
-```rust
-use parakeet_rs::{Nemotron, NemotronMode};
-
-let mut model = Nemotron::from_pretrained(path, None)?;
-
-// Multilingual variant: optionally pick a target language. Defaults to "auto"
-// (the model picks the language itself). Pass a specific code when you know
-// the language it's strictly more accurate. No-op when an English-only model is loaded.
-if model.mode() == NemotronMode::Multilingual {
-    model.set_target_lang("es-ES")?; // also: "ja-JP", "tr-TR", "auto", ...
-}
-
-// Process in 560ms chunks for streaming
-const CHUNK_SIZE: usize = 8960; // 560ms at 16kHz
-for chunk in audio.chunks(CHUNK_SIZE) {
-    let text = model.transcribe_chunk(chunk)?;
-    print!("{}", text);
-}
-```
-
-**Cohere Transcribe (Offline Multilingual)**: 14 languages, punctuation & ITN toggles (yes, "parakeets🦜" talk about more than just NVIDIA right?? :-P)
-```toml
-parakeet-rs = { version = "0.3", features = ["cohere"] }
-```
-```rust
-use parakeet_rs::CohereASR;
-
-let mut model = CohereASR::from_pretrained("./cohere", None)?;
-
-// audio: Vec<f32>, 16kHz mono (long-form supported)
-let text = model.transcribe_audio(&audio, "en", true, false)?; // lang, pnc, itn
-println!("{}", text);
-```
-See `examples/cohere.rs` for a runnable demo.
-
-**Multitalker (Streaming Multi-Speaker ASR)**: Speaker-attributed transcription
-```toml
-parakeet-rs = { version = "0.3", features = ["multitalker"] }
-```
-```rust
-use parakeet_rs::MultitalkerASR;
-
-let mut model = MultitalkerASR::from_pretrained(
-    "./multitalker",             // encoder, decoder, tokenizer
-    "nemotron3_diar_v3.onnx",    // Nemotron-3 (Sortformer v3) for diarization
-    None,
+let mut asr = Nemotron::from_pretrained(
+    "~/.asr/nemotron_multi",
+    Some(ExecutionConfig::default().with_intra_threads(1)),
 )?;
 
-for chunk in audio.chunks(17920) {  // ~1.12s at 16kHz
-    let results = model.transcribe_chunk(chunk)?;
-    for r in &results {
-        println!("[Speaker {}] {}", r.speaker_id, r.text);
-    }
-}
-```
-See `examples/multitalker.rs` for full usage with latency modes.
-
-**Nemotron-3 Diarization (Sortformer v3)**: Streaming diarization, up to 8 speakers
-```toml
-parakeet-rs = { version = "0.3", features = ["sortformer"] }
-```
-```rust
-use parakeet_rs::sortformer::{Sortformer, StreamingProfile};
-
-let mut diarizer = Sortformer::new("nemotron3_diar_v3.onnx")?;
-let segments = diarizer.diarize(audio, 16000, 1)?;
-for seg in segments {
-    println!("speaker_{} [{:.2}s - {:.2}s]", seg.speaker_id,
-        seg.start as f64 / 16_000.0, seg.end as f64 / 16_000.0);
+if asr.mode() == NemotronMode::Multilingual {
+    asr.set_target_lang("tr-TR")?;   // or "auto"
 }
 
-// Streaming/real-time: diarize_chunk() / feed() preserve state across calls.
-let segments = diarizer.diarize_chunk(&audio_chunk_16k_mono)?;
+// Streaming: call repeatedly with ~20-100ms of 16kHz mono audio
+let delta = asr.transcribe_chunk(&audio_chunk)?;
 
-// Latency presets from NVIDIA's model card:
-// offline() 30.4s (default), low_latency() 1.04s, very_low_latency() 0.64s, ultra_low_latency() 0.32s
-diarizer.set_profile(StreamingProfile::low_latency())?;
-```
-See `examples/diarization.rs` for a runnable example (pass `low`, `very-low` or `ultra` to try
-the latency presets) and `examples/streaming_diarization.rs` for real-time `feed`/`flush`.
-
-See `scripts/export_diar_sortformer.py` for exporting the ONNX (dual-resolution,
-self-describing metadata) with custom streaming parameters.
-
-## Setup
-
-**CTC**: Download from [HuggingFace](https://huggingface.co/onnx-community/parakeet-ctc-0.6b-ONNX/tree/main/onnx): `model.onnx`, `model.onnx_data`, `tokenizer.json`
-
-**TDT**: Download from [HuggingFace](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx): `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`, `vocab.txt`
-
-**Parakeet Ultra (optional TDT fine-tune)**: Moondream's post-trained parakeet-tdt-0.6b-v3 with better accuracy. Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/parakeet-ultra): same files as TDT, loads with `ParakeetTDT` (CC-BY-4.0). Or export it yourself with `scripts/export_parakeet_ultra.py`.
-
-**Orukeet (optional TDT fine-tune)**: the [pinned Hugging Face INT8 export](https://huggingface.co/oruk/orukeet/tree/eac739d754bb171287930e6e63386f5b88f8179e/onnx/combined-v0.1.0-int8) works with `ParakeetTDT`. The downloader verifies a release manifest and all required file hashes, including licenses, then prints the cached model directory:
-
-```bash
-python3 -m pip install huggingface-hub
-model_dir=$(python3 scripts/download_orukeet.py)
-cargo run --release --example orukeet -- "$model_dir" audio.wav
-# After installation, no network is needed:
-model_dir=$(python3 scripts/download_orukeet.py --offline)
+// Offline
+let full = asr.transcribe_audio(&audio)?;
 ```
 
-This uses the existing local TDT runtime; it does not add streaming support or change defaults. The ~672 MB weights are licensed under [CC BY-SA 4.0](https://huggingface.co/oruk/orukeet/blob/eac739d754bb171287930e6e63386f5b88f8179e/onnx/combined-v0.1.0-int8/LICENSE-WEIGHTS), as recorded in the downloaded `LICENSE-WEIGHTS`; `NOTICE.md` preserves the NVIDIA/Parakeet attribution. Model downloads use normal Hugging Face accounting through the required verification manifest. Audio stays local; cached files cause no counting requests. Accuracy numbers on the model card describe its NeMo evaluation, not a benchmark of this Rust runtime.
-
-**EOU**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/realtime_eou_120m-v1-onnx): `encoder.onnx`, `decoder_joint.onnx`, `tokenizer.json`
-
-**Nemotron (English-only)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-speech-streaming-en-0.6b): `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` (*[int8](https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int8) / [int4](https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int4)*)
-
-**Nemotron (Multilingual 3.5)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-3.5-asr-streaming-0.6b-onnx): `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model`. Or export it yourself from the [base model](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) with `scripts/export_nemotron_streaming_multilingual.py`.
-
-**Unified**: Download from [HuggingFace](https://huggingface.co/bobNight/parakeet-unified-en-0.6b-onnx): `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model`
-
-**Multitalker**: Download from [HuggingFace](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8/tree/main): `encoder.int8.onnx`, `decoder_joint.int8.onnx`, `tokenizer.model` (also needs the Nemotron-3 diarization ONNX below)
-
-**Cohere Transcribe**: Download from [HuggingFace](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX): `encoder_model.onnx` (+ `.onnx_data*`), `decoder_model_merged.onnx` (+ `.onnx_data`), `tokenizer.json` (FP32, FP16, INT8, INT4 variants available)
-
-**Diarization (Nemotron-3 / Sortformer v3)**: Download from [HuggingFace](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-3-diarization): `nemotron3_diar_v3.onnx`. Or export it yourself from the [base model](https://huggingface.co/nvidia/Nemotron-3-Diarization) with `scripts/export_diar_sortformer.py`.
-
-Quantized versions available (int8). All files must be in the same directory.
-
-GPU support (auto-falls back to CPU if fails):
-```toml
-parakeet-rs = { version = "0.3", features = ["cuda"] }  # or tensorrt, webgpu, directml, migraphx or other ort supported EPs (check cargo features)
-```
-
-```rust
-use parakeet_rs::{Parakeet, ExecutionConfig, ExecutionProvider};
-
-let config = ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda);
-let mut parakeet = Parakeet::from_pretrained(".", Some(config))?;
-```
-
-Advanced session configuration via [ort SessionBuilder](https://docs.rs/ort/latest/ort/session/builder/struct.SessionBuilder.html):
-```rust
-let config = ExecutionConfig::new()
-    .with_custom_configure(|builder| builder.with_memory_pattern(false));
-```
-
-## Features
-
-- [CTC: English with punctuation & capitalization](https://huggingface.co/nvidia/parakeet-ctc-0.6b)
-- [TDT: Multilingual (auto lang detection)](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
-- [Parakeet Ultra: Moondream's post-trained TDT, same API](https://huggingface.co/moondream/parakeet-ultra) ([ONNX](https://huggingface.co/altunenes/parakeet-rs/tree/main/parakeet-ultra))
-- [EOU: Streaming ASR with end-of-utterance detection](https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1)
-- [Nemotron: Cache aware streaming ASR (600M params,EN only)](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
-- [Unified: Offline + buffered streaming RNNT ASR (600M params, EN only)](https://huggingface.co/nvidia/parakeet-unified-en-0.6b)
-- [Multitalker: Streaming multi-speaker ASR with speaker-kernel injection](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1) ([ONNX int8](https://huggingface.co/smcleod/multitalker-parakeet-streaming-0.6b-v1-onnx-int8))
-- [Cohere Transcribe: Offline multilingual ASR (14 languages, long-form supported)](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) ([ONNX](https://huggingface.co/onnx-community/cohere-transcribe-03-2026-ONNX))
-- [Nemotron-3 Diarization (Sortformer v3): Streaming speaker diarization (up to 8 speakers)](https://huggingface.co/nvidia/Nemotron-3-Diarization) ([ONNX](https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-3-diarization))
-- Token-level timestamps (CTC, TDT)
-
-## Notes
-
-- Audio: 16kHz mono WAV (16-bit PCM or 32-bit float)
-- CTC/TDT models have ~4-5 minute audio length limit. For longer files, use streaming models or split into chunks
-
-## License
-
-Code: MIT OR Apache-2.0
-
-FYI: The Parakeet ONNX models (downloaded separately from HuggingFace) by NVIDIA. This library does not distribute the models.
+For several concurrent streams sharing one loaded model, use `NemotronHandle::from_pretrained` once and then
+`Nemotron::from_shared(&handle)` per stream  the ONNX session is loaded and reference counted, and each
+stream keeps independent decoder state.
