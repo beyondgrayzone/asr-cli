@@ -234,7 +234,7 @@ pub struct RawDiarizationPredictions {
     pub num_valid_frames: usize,
 }
 
-/// `(chunk mel frames, spkcache frames, fifo frames)` — the input dims that vary over a stream.
+/// `(chunk mel frames, spkcache frames, fifo frames)`  the input dims that vary over a stream.
 pub type StreamingWindow = (usize, usize, usize);
 
 /// Supplies a session per streaming window, for graphs with fixed input shapes.

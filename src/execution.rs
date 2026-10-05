@@ -5,6 +5,15 @@ use crate::error::Result;
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
 
+// Gate the `load-dynamic` feature, which deadlocks at runtime unless a
+// matching system `libonnxruntime.so` is installed (see the feature docs in
+// Cargo.toml). Placed at module scope so it cannot be attributed to the
+// following item: when active it stops the compile, when inactive it vanishes.
+// Do not attach a doc comment here -- rustdoc does not generate documentation
+// for macro invocations and warns about it.
+#[cfg(all(feature = "load-dynamic", not(asr_allow_load_dynamic)))]
+compile_error!("asr: `load-dynamic` needs ASR_ALLOW_LOAD_DYNAMIC=1; see Cargo.toml. Otherwise build plain.");
+
 // Hardware acceleration options. CPU is default and most reliable.
 // GPU providers (CUDA, TensorRT, MIGraphX) offer 5-10x speedup but require specific hardware.
 // All GPU providers automatically fall back to CPU if they fail.

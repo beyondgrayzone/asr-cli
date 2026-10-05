@@ -52,7 +52,7 @@ pub struct TokenInfo {
 /// Numerically stable log-softmax value at `idx` over the full logits vector.
 ///
 /// `max_logit` is the maximum logit, which the greedy decode loop already
-/// computes while taking the argmax — passing it in lets us walk the logits
+/// computes while taking the argmax  passing it in lets us walk the logits
 /// just once more (the exp-sum) instead of a second max pass.
 fn log_softmax_at(logits: &[f32], idx: usize, max_logit: f32) -> f32 {
     let lse = max_logit + logits.iter().map(|x| (x - max_logit).exp()).sum::<f32>().ln();
@@ -68,7 +68,7 @@ fn log_softmax_at(logits: &[f32], idx: usize, max_logit: f32) -> f32 {
 ///     hi, ja, ko, vi, uk (with locales).
 ///   - **Broad-coverage (13):** pl, sv, cs, nb, da, bg, fi, hr, sk, zh-CN,
 ///     hu, ro, et.
-///   - **Adaptation-ready (8):** el, lt, lv, mt, sl, he, th, nn — recognized
+///   - **Adaptation-ready (8):** el, lt, lv, mt, sl, he, th, nn  recognized
 ///     by the tokenizer but need fine-tuning for production quality.
 ///
 /// The full dictionary below contains additional entries because (a) several
@@ -473,7 +473,7 @@ impl Nemotron {
     /// (~20-50 ms per 560 ms audio chunk).
     ///
     /// For the multilingual variant the new instance defaults to `auto`
-    /// (prompt index 101) — the model picks the language itself. Override
+    /// (prompt index 101)  the model picks the language itself. Override
     /// via [`Self::set_target_lang`] when you know the language; that's
     /// strictly more accurate.
     pub fn from_shared(handle: &NemotronHandle) -> Self {
@@ -534,11 +534,11 @@ impl Nemotron {
     /// Adaptation-ready locales need fine-tuning for production quality.
     /// The full prompt dictionary accepts additional codes (e.g. `qu-PE`,
     /// `mi-NZ`, `haw-US`) that the model has prompt slots for but are not
-    /// in the model card — those will run, but accuracy is not guaranteed.
+    /// in the model card  those will run, but accuracy is not guaranteed.
     /// See: https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
     ///
     /// Returns an error on the English-only variant or for an unknown language.
-    /// The new language takes effect on the next encoder call — for clean
+    /// The new language takes effect on the next encoder call  for clean
     /// switching mid-utterance you usually also want [`Self::reset`].
     pub fn set_target_lang(&mut self, lang: &str) -> Result<()> {
         if self.mode != NemotronMode::Multilingual {

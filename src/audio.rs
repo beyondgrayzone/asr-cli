@@ -194,7 +194,7 @@ pub fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) ->
 /// Extract mel spectrogram features from raw audio samples.
 ///
 /// The `cache` holds the mel filterbank and FFT plan built once at model
-/// load — these are deterministic from `config` and identical across calls,
+/// load  these are deterministic from `config` and identical across calls,
 /// so reusing them avoids rebuilding ~15-20 µs of arithmetic per request.
 ///
 /// # Arguments

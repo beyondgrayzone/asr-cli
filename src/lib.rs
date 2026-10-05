@@ -43,6 +43,11 @@
 //! - Channels: Mono (stereo will be converted automatically)
 //! - Bit Depth: 16-bit PCM or 32-bit float
 
+// Must stay ahead of the `ort`/`ort-sys` modules so the `__isoc23_*`
+// definitions are present in the final link on glibc < 2.38. Compiles to
+// nothing on non-linux-gnu targets.
+mod glibc_compat;
+
 mod audio;
 mod config;
 mod decoder;

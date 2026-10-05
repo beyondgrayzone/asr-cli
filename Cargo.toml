@@ -1,49 +1,16 @@
 [package]
-name = "parakeet-rs"
-version = "0.3.8"
+name = "asr"
+version = "0.0.2"
 edition = "2024"
-authors = ["altunenes"]
-description = "Fast ASR & Speaker Diarization with NVIDIA Parakeet via ONNX"
-repository = "https://github.com/altunenes/parakeet-rs"
+authors = ["altunenes", "dhawal"]
+description = "Fast ASR with nemotron"
+repository = "https://github.com/beyondgrayzone/asr-server"
 license = "MIT OR Apache-2.0"
 keywords = ["speech-recognition", "asr", "parakeet", "onnx", "nvidia"]
 categories = ["multimedia::audio", "science"]
 
-[lib]
-name = "parakeet_rs"
-path = "src/lib.rs"
-
-[[example]]
-name = "diarization"
-path = "examples/diarization.rs"
-
-[[example]]
-name = "raw"
-path = "examples/raw.rs"
-
-[[example]]
-name = "streaming"
-path = "examples/streaming.rs"
-
-[[example]]
-name = "multitalker"
-path = "examples/multitalker.rs"
-
-[[example]]
-name = "streaming-diarization"
-path = "examples/streaming_diarization.rs"
-
-[[example]]
-name = "shared_model"
-path = "examples/shared_model.rs"
-
-[[example]]
-name = "cohere"
-path = "examples/cohere.rs"
-required-features = ["cohere"]
-
 [dependencies]
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24"] }
 hound = "3.5"
 eyre = "0.6"
 ndarray = "0.17"
@@ -55,15 +22,9 @@ realfft = "3"
 [dev-dependencies]
 
 [features]
-default = ["cpu", "ort-defaults", "api-28"]
+default = ["cpu", "ort-defaults"]
 cpu = []
 ort-defaults = ["ort/default"]
-
-api-24 = ["ort/api-24"]
-api-25 = ["ort/api-25"]
-api-26 = ["ort/api-26"]
-api-27 = ["ort/api-27"]
-api-28 = ["ort/api-28"]
 cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
 coreml = ["ort/coreml"]
@@ -75,5 +36,19 @@ nnapi = ["ort/nnapi"]
 sortformer = []
 multitalker = ["sortformer"]
 cohere = []
+# WARNING: enabling this DEADLOCKS the server at runtime unless a matching
+# `libonnxruntime.so` is already installed system-wide.
+#
+# Without one, `ort` calls `dlopen`, that fails, and the error-reporting path
+# re-enters `ort::api()` while its `OnceLock` is still initializing -- a
+# self-deadlock on a `std::sync::Once` futex. The process hangs forever with no
+# output and the loader thread sits at 0% CPU in `futex_wait`. The BUILD STILL
+# SUCCEEDS, so it is easy to mistake for a slow model load.
+#
+# `src/glibc_compat.rs` already handles the prebuilt-binary glibc mismatch, so a
+# plain `cargo build` works on glibc < 2.38 and this feature is never needed.
+# It is therefore gated behind `build.rs`: opting in requires setting
+# ASR_ALLOW_LOAD_DYNAMIC=1, which turns a silent runtime hang into a loud build
+# failure.
 load-dynamic = ["ort/load-dynamic"]
 preload-dylibs = ["ort/preload-dylibs"]
